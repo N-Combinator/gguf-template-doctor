@@ -1,0 +1,2 @@
+[console_scripts]
+gguf-template-doctor = gguf_template_doctor.cli:entrypoint
