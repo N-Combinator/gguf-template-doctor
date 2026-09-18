@@ -80,6 +80,30 @@ def test_real_gguf_records_its_provenance(real_gguf):
     assert gguf.metadata["testing.vocab_trimmed_from"] == 151936
 
 
+def test_parses_second_real_gguf_header(nemo_gguf):
+    """A second published file, different tokenizer and metadata layout."""
+    gguf = parse_header(nemo_gguf)
+    assert gguf.version == 3
+    assert gguf.metadata["general.architecture"] == "llama"
+    assert gguf.metadata["general.name"] == "Mistral Nemo Instruct 2407"
+    assert gguf.metadata["tokenizer.ggml.pre"] == "tekken"
+    assert gguf.metadata["general.languages"][:3] == ["en", "fr", "de"]
+    assert gguf.metadata["llama.context_length"] == 1_024_000
+    assert len(gguf.metadata["tokenizer.chat_template"]) == 3945
+    assert "huggingface.co/bartowski/Mistral-Nemo-Instruct-2407-GGUF" in (
+        gguf.metadata["general.source.url"]
+    )
+    assert gguf.metadata["testing.vocab_trimmed_from"] == 131072
+
+
+def test_second_real_gguf_reports_its_missing_tensor_data(nemo_gguf):
+    """Header-only: metadata is complete, the payload is not, and that is a warning."""
+    gguf = parse_header(nemo_gguf)
+    assert gguf.tensor_count == len(gguf.tensors) == 3
+    assert len(gguf.warnings) == 1
+    assert "tensor data" in gguf.warnings[0]
+
+
 # --------------------------------------------------------------------------
 # Criterion 1: all KV value types from the specification.
 # --------------------------------------------------------------------------
