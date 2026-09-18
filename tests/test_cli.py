@@ -8,7 +8,7 @@ import subprocess
 import sys
 
 import pytest
-from gguf_builder import ARRAY, STRING, UINT32, build_gguf
+from gguf_builder import ARRAY, FLOAT32, FLOAT64, STRING, UINT32, build_gguf
 
 from gguf_template_doctor.cli import (
     EXIT_FINDINGS,
@@ -288,3 +288,55 @@ def test_module_invocation_succeeds_on_real_file(real_gguf):
     )
     assert result.returncode == 0, result.stderr
     assert "qwen2" in result.stdout
+
+
+@pytest.fixture
+def non_finite_model(tmp_path):
+    """A model whose float metadata holds NaN and +/-Infinity.
+
+    Legal GGUF: FLOAT32/FLOAT64 are IEEE-754, so these are representable and
+    real files can carry them.
+    """
+    path = tmp_path / "nonfinite.gguf"
+    path.write_bytes(
+        build_gguf(
+            [
+                ("general.architecture", STRING, "llama"),
+                ("general.name", STRING, "non-finite"),
+                ("tokenizer.ggml.model", STRING, "gpt2"),
+                ("tokenizer.ggml.tokens", ARRAY, (STRING, VOCAB)),
+                ("tokenizer.ggml.eos_token_id", UINT32, 1),
+                ("tokenizer.chat_template", STRING, GOOD_TEMPLATE),
+                ("llama.rope.freq_base", FLOAT32, float("nan")),
+                ("llama.attention.clamp_kqv", FLOAT64, float("inf")),
+                ("llama.expert_weights_scale", FLOAT32, float("-inf")),
+                ("llama.f32.scales", ARRAY, (FLOAT32, [1.5, float("nan")])),
+            ]
+        )
+    )
+    return path
+
+
+def test_json_output_with_non_finite_floats_is_strict_json(non_finite_model):
+    """Bare NaN/Infinity literals are not JSON; a strict parser must accept us."""
+    code, out, _ = run(str(non_finite_model), "--json", "--list-metadata")
+    assert code == EXIT_OK
+
+    # json.loads accepts the bare literals by default, so reject them explicitly.
+    def _no_constants(name):
+        raise AssertionError(f"non-JSON literal {name!r} in output")
+
+    payload = json.loads(out, parse_constant=_no_constants)
+    metadata = payload["metadata"]
+    assert metadata["llama.rope.freq_base"] == "NaN"
+    assert metadata["llama.attention.clamp_kqv"] == "Infinity"
+    assert metadata["llama.expert_weights_scale"] == "-Infinity"
+    # Finite values inside arrays stay numbers; only the non-finite one converts.
+    assert metadata["llama.f32.scales"] == [1.5, "NaN"]
+
+
+def test_json_output_keeps_finite_floats_as_numbers(non_finite_model):
+    code, out, _ = run(str(non_finite_model), "--json", "--list-metadata")
+    assert code == EXIT_OK
+    payload = json.loads(out)
+    assert isinstance(payload["metadata"]["llama.f32.scales"][0], float)

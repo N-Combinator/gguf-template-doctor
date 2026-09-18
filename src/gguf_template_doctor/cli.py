@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
-from typing import Sequence, TextIO
+from typing import Any, Sequence, TextIO
 
 from . import __version__
 from .doctor import Report, Severity, diagnose, summarize
@@ -27,6 +28,27 @@ _SEVERITY_LABEL = {
     Severity.WARNING: "warning",
     Severity.INFO: "info",
 }
+
+
+def _json_safe(value: Any) -> Any:
+    """Replace non-finite floats so the output is valid JSON.
+
+    GGUF FLOAT32/FLOAT64 metadata may legitimately hold NaN or +/-Infinity.
+    ``json`` spells those as the bare literals ``NaN``/``Infinity``, which no
+    strict JSON parser accepts, so render them as strings instead. The value
+    stays visible in the report rather than being silently dropped.
+    """
+    if isinstance(value, float):
+        if math.isnan(value):
+            return "NaN"
+        if math.isinf(value):
+            return "Infinity" if value > 0 else "-Infinity"
+        return value
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -179,7 +201,16 @@ def main(
                 # Long arrays would dwarf the report; report their length instead.
                 if not (isinstance(value, list) and len(value) > 64)
             }
-        json.dump(payload, out, indent=2, sort_keys=True, default=str)
+        # allow_nan=False makes any non-finite value we failed to convert a
+        # loud ValueError instead of silently invalid JSON on stdout.
+        json.dump(
+            _json_safe(payload),
+            out,
+            indent=2,
+            sort_keys=True,
+            default=str,
+            allow_nan=False,
+        )
         print("", file=out)
     else:
         _print_text_report(report, gguf, args, out)

@@ -40,6 +40,10 @@ summary: 0 error(s), 0 warning(s), 0 info
 | `--list-metadata` | print every metadata key with its type and value |
 | `--strict` | exit 1 on `info` findings too, not just warnings and errors |
 
+`--json` always emits strict JSON. GGUF float metadata may hold IEEE-754 NaN or infinities, which
+have no JSON literal, so those values are emitted as the strings `"NaN"`, `"Infinity"` and
+`"-Infinity"` rather than the bare tokens a strict parser would reject.
+
 ### Exit codes
 
 | Code | Meaning |
