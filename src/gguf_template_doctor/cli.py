@@ -1,9 +1,14 @@
 """Command line interface for gguf-template-doctor.
 
 Exit codes:
-  0  the file was read and no problems worse than INFO were found
-  1  the file was read but the doctor reported warnings or errors
+  0  the file was read and nothing at or above the failure threshold was found
+  1  the file was read and the doctor reported a finding at that threshold
   2  the file could not be read: missing, not GGUF, truncated or malformed
+
+The threshold is ERROR by default: a warning describes a template that is
+likely wrong but still usable, and widely used healthy models do trigger one
+(`no-generation-prompt` fires on the whole Mistral [INST] family), so warnings
+must not make a CI step red unless the user asks for it with --strict.
 """
 
 from __future__ import annotations
@@ -29,6 +34,18 @@ _SEVERITY_LABEL = {
     Severity.WARNING: "warning",
     Severity.INFO: "info",
 }
+
+#: --fail-on thresholds, most severe first.  A finding makes the run fail when
+#: its severity is at least as severe as the chosen threshold, so "error" (the
+#: default) ignores warnings and info.
+_SEVERITY_ORDER = (Severity.ERROR, Severity.WARNING, Severity.INFO)
+_FAIL_ON_LEVELS = {
+    _SEVERITY_LABEL[severity]: _SEVERITY_ORDER[: index + 1]
+    for index, severity in enumerate(_SEVERITY_ORDER)
+}
+DEFAULT_FAIL_ON = "error"
+#: What --strict means, in --fail-on terms.
+STRICT_FAIL_ON = "warning"
 
 
 def _json_safe(value: Any) -> Any:
@@ -116,12 +133,37 @@ def _build_parser() -> argparse.ArgumentParser:
         help="print every metadata key with its type and value",
     )
     parser.add_argument(
+        "--fail-on",
+        choices=sorted(_FAIL_ON_LEVELS),
+        default=DEFAULT_FAIL_ON,
+        metavar="{error,warning,info}",
+        help=(
+            "lowest severity that makes the run exit 1 (default: error, so "
+            "warnings and info report but do not fail)"
+        ),
+    )
+    parser.add_argument(
         "--strict",
         action="store_true",
-        help="exit 1 on INFO findings as well as warnings and errors",
+        help="same as --fail-on warning: let warnings exit 1 too",
     )
     parser.add_argument("--version", action="version", version=__version__)
     return parser
+
+
+def resolve_fail_on(fail_on: str, strict: bool) -> tuple[Severity, ...]:
+    """Severities that make the run exit 1.
+
+    ``--strict`` is a spelling of ``--fail-on warning``; when both are given the
+    more demanding of the two wins, so ``--strict --fail-on info`` still fails
+    on info rather than being quietly downgraded.
+    """
+    threshold = _SEVERITY_ORDER.index(_FAIL_ON_LEVELS[fail_on][-1])
+    if strict:
+        threshold = max(
+            threshold, _SEVERITY_ORDER.index(_FAIL_ON_LEVELS[STRICT_FAIL_ON][-1])
+        )
+    return _SEVERITY_ORDER[: threshold + 1]
 
 
 def _format_value(value: object) -> str:
@@ -204,6 +246,15 @@ def _print_text_report(
         f"summary: {errors} error(s), {warnings} warning(s), {infos} info",
         file=out,
     )
+    # Say what the exit code is going to mean: a warning-only run exits 0 by
+    # default, and a reader who sees "1 warning(s)" deserves to know why.
+    failing = resolve_fail_on(args.fail_on, args.strict)
+    if Severity.WARNING not in failing and warnings:
+        print(
+            f"note: exit code reflects errors only ({warnings} warning(s) "
+            "ignored); use --strict to fail on warnings too",
+            file=out,
+        )
 
 
 def main(
@@ -224,6 +275,12 @@ def main(
         return EXIT_UNREADABLE
 
     report = diagnose(gguf)
+    failing = resolve_fail_on(args.fail_on, args.strict)
+    exit_code = (
+        EXIT_FINDINGS
+        if any(f.severity in failing for f in report.findings)
+        else EXIT_OK
+    )
 
     buffer = io.StringIO()
     if args.json:
@@ -231,6 +288,10 @@ def main(
         payload["gguf_version"] = gguf.version
         payload["tensor_count"] = gguf.tensor_count
         payload["metadata_key_count"] = gguf.kv_count
+        # The severity policy is part of the answer: "ok" describes the file,
+        # "exit_code" describes what this invocation decided about it.
+        payload["fail_on"] = _SEVERITY_LABEL[failing[-1]]
+        payload["exit_code"] = exit_code
         if args.show_template:
             payload["template_sources"] = {
                 t.name: t.source for t in report.templates
@@ -258,11 +319,7 @@ def main(
     # the template's characters, and that must not become a traceback.
     _write_text(out, buffer.getvalue())
 
-    if report.errors or report.warnings:
-        return EXIT_FINDINGS
-    if args.strict and report.findings:
-        return EXIT_FINDINGS
-    return EXIT_OK
+    return exit_code
 
 
 def entrypoint() -> None:  # pragma: no cover - thin console-script wrapper

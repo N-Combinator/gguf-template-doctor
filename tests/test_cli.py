@@ -11,11 +11,15 @@ import pytest
 from gguf_builder import ARRAY, FLOAT32, FLOAT64, STRING, UINT32, build_gguf
 
 from gguf_template_doctor.cli import (
+    _FAIL_ON_LEVELS,
+    _SEVERITY_LABEL,
     EXIT_FINDINGS,
     EXIT_OK,
     EXIT_UNREADABLE,
     main,
+    resolve_fail_on,
 )
+from gguf_template_doctor.doctor import Severity
 
 GOOD_TEMPLATE = (
     "{% for message in messages %}"
@@ -92,8 +96,19 @@ def test_published_nemo_header_reports_no_errors(nemo_gguf):
     code, out, err = run(str(nemo_gguf))
     assert "unbalanced" not in out
     assert "0 error(s)" in out
-    assert code == EXIT_FINDINGS  # the remaining no-generation-prompt warning
+    # A published, healthy model must not be reported as failing: its only
+    # warning is no-generation-prompt, which the [INST] family legitimately has.
+    assert code == EXIT_OK
+    assert "1 warning(s)" in out
     assert err == ""
+
+
+def test_published_nemo_header_fails_only_under_strict(nemo_gguf):
+    """The warning is still reported, and --strict is what makes it fail."""
+    assert run(str(nemo_gguf))[0] == EXIT_OK
+    code, out, _ = run(str(nemo_gguf), "--strict")
+    assert code == EXIT_FINDINGS
+    assert "no-generation-prompt" in out
 
 
 def test_show_template_prints_the_real_template(real_gguf, qwen_template):
@@ -130,8 +145,12 @@ def test_missing_template_exits_one(tmp_path):
     assert "no-chat-template" in out
 
 
-def test_eos_id_past_the_vocabulary_exits_one(tmp_path):
-    """A file whose eos id points past its own vocabulary must not look healthy."""
+def test_eos_id_past_the_vocabulary_is_reported(tmp_path):
+    """A file whose eos id points past its own vocabulary must not look healthy.
+
+    The finding is a warning, so it is reported in full but only fails the run
+    under --strict.
+    """
     path = tmp_path / "bad-eos.gguf"
     path.write_bytes(
         build_gguf(
@@ -145,16 +164,109 @@ def test_eos_id_past_the_vocabulary_exits_one(tmp_path):
         )
     )
     code, out, _ = run(str(path))
-    assert code == EXIT_FINDINGS
+    assert code == EXIT_OK
     assert "token-id-out-of-range" in out
     assert "eos_token_id is 999" in out
+    assert run(str(path), "--strict")[0] == EXIT_FINDINGS
 
 
-def test_strict_turns_info_into_failure(real_gguf):
+# --------------------------------------------------------------------------
+# Severity versus exit code.
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def warning_only_model(tmp_path):
+    """A file whose only finding is a warning (no add_generation_prompt)."""
+    path = tmp_path / "warning-only.gguf"
+    path.write_bytes(
+        build_gguf(
+            [
+                ("general.architecture", STRING, "llama"),
+                ("tokenizer.ggml.model", STRING, "gpt2"),
+                ("tokenizer.ggml.tokens", ARRAY, (STRING, VOCAB)),
+                ("tokenizer.ggml.eos_token_id", UINT32, 1),
+                (
+                    "tokenizer.chat_template",
+                    STRING,
+                    "{% for m in messages %}"
+                    "{{ '<|im_start|>' + m.role + m.content + '<|im_end|>' }}"
+                    "{% endfor %}",
+                ),
+            ]
+        )
+    )
+    return path
+
+
+def test_warning_only_file_exits_zero_by_default(warning_only_model):
+    """A warning describes a usable file, so it must not fail the run."""
+    code, out, _ = run(str(warning_only_model))
+    assert code == EXIT_OK
+    # Reported all the same, with the exit-code policy spelled out.
+    assert "warning: [default] no-generation-prompt" in out
+    assert "0 error(s), 1 warning(s)" in out
+    assert "--strict" in out
+
+
+def test_warning_only_file_exits_one_under_strict(warning_only_model):
+    code, out, _ = run(str(warning_only_model), "--strict")
+    assert code == EXIT_FINDINGS
+    assert "no-generation-prompt" in out
+
+
+def test_strict_is_the_same_as_fail_on_warning(warning_only_model):
+    assert run(str(warning_only_model), "--fail-on", "warning")[0] == EXIT_FINDINGS
+    assert run(str(warning_only_model), "--fail-on", "error")[0] == EXIT_OK
+
+
+def test_error_exits_one_at_every_threshold(broken_model):
+    """An error is an error: no threshold makes a broken template pass."""
+    for flags in ([], ["--strict"], ["--fail-on", "error"], ["--fail-on", "info"]):
+        code, out, _ = run(str(broken_model), *flags)
+        assert code == EXIT_FINDINGS, (flags, out)
+
+
+def test_info_only_fails_under_fail_on_info(real_gguf):
+    """--strict stops at warnings; info needs the explicit threshold."""
     assert run(str(real_gguf))[0] == EXIT_OK
-    code, out, _ = run(str(real_gguf), "--strict")
+    assert run(str(real_gguf), "--strict")[0] == EXIT_OK
+    code, out, _ = run(str(real_gguf), "--fail-on", "info")
     assert code == EXIT_FINDINGS
     assert "partial-vocabulary" in out
+
+
+def test_strict_never_lowers_an_explicit_threshold(real_gguf):
+    """--strict --fail-on info keeps the stricter of the two."""
+    code, _, _ = run(str(real_gguf), "--strict", "--fail-on", "info")
+    assert code == EXIT_FINDINGS
+
+
+def test_json_reports_the_threshold_and_the_exit_code(warning_only_model):
+    code, out, _ = run(str(warning_only_model), "--json")
+    payload = json.loads(out)
+    assert code == EXIT_OK
+    assert payload["fail_on"] == "error"
+    assert payload["exit_code"] == EXIT_OK
+    # "ok" still describes the file, not the exit policy.
+    assert payload["ok"] is False
+    assert any(f["code"] == "no-generation-prompt" for f in payload["findings"])
+
+    code, out, _ = run(str(warning_only_model), "--strict", "--json")
+    payload = json.loads(out)
+    assert code == EXIT_FINDINGS
+    assert payload["fail_on"] == "warning"
+    assert payload["exit_code"] == EXIT_FINDINGS
+
+
+def test_unknown_fail_on_value_is_rejected(real_gguf):
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            [str(real_gguf), "--fail-on", "nonsense"],
+            out=io.StringIO(),
+            err=io.StringIO(),
+        )
+    assert excinfo.value.code == 2
 
 
 # --------------------------------------------------------------------------
@@ -463,3 +575,31 @@ def test_unreadable_file_error_survives_a_non_utf8_stderr(tmp_path):
     code = main([str(path)], out=out, err=err)
     assert code == EXIT_UNREADABLE
     assert "error:" in err.getvalue()
+
+
+# --------------------------------------------------------------------------
+# The threshold resolution itself.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "fail_on,strict,expected",
+    [
+        ("error", False, {Severity.ERROR}),
+        ("error", True, {Severity.ERROR, Severity.WARNING}),
+        ("warning", False, {Severity.ERROR, Severity.WARNING}),
+        ("warning", True, {Severity.ERROR, Severity.WARNING}),
+        ("info", False, {Severity.ERROR, Severity.WARNING, Severity.INFO}),
+        # --strict must not relax a threshold the user set explicitly.
+        ("info", True, {Severity.ERROR, Severity.WARNING, Severity.INFO}),
+    ],
+)
+def test_resolve_fail_on(fail_on, strict, expected):
+    assert set(resolve_fail_on(fail_on, strict)) == expected
+
+
+def test_every_severity_is_a_fail_on_choice():
+    """A new severity must not silently become unreachable by --fail-on."""
+    assert set(_FAIL_ON_LEVELS) == {
+        label for label in (_SEVERITY_LABEL[s] for s in Severity)
+    }
