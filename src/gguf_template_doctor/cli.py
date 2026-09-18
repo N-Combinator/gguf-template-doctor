@@ -62,7 +62,7 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _format_value(value: object, type_id: int | None) -> str:
+def _format_value(value: object) -> str:
     if isinstance(value, list):
         preview = ", ".join(repr(v) for v in value[:4])
         suffix = ", ..." if len(value) > 4 else ""
@@ -83,7 +83,7 @@ def _print_metadata(gguf, out: TextIO) -> None:
         except ValueError:  # pragma: no cover - guarded by the parser
             type_name = str(type_id)
         print(
-            f"  {key} ({type_name}) = {_format_value(value, type_id)}",
+            f"  {key} ({type_name}) = {_format_value(value)}",
             file=out,
         )
 

@@ -335,7 +335,7 @@ def _vocabulary(gguf: GgufFile) -> set[str] | None:
 
 
 def _check_special_tokens(
-    source: str, name: str, gguf: GgufFile, vocabulary: set[str] | None
+    source: str, name: str, vocabulary: set[str] | None
 ) -> list[Finding]:
     """Verify special tokens used by the template exist in the vocabulary.
 
@@ -360,7 +360,7 @@ def _check_special_tokens(
     return findings
 
 
-def _eos_token(gguf: GgufFile, vocabulary: set[str] | None) -> str | None:
+def _eos_token(gguf: GgufFile) -> str | None:
     token_id = gguf.metadata.get("tokenizer.ggml.eos_token_id")
     tokens = gguf.metadata.get("tokenizer.ggml.tokens")
     if not isinstance(token_id, int) or not isinstance(tokens, list):
@@ -448,7 +448,7 @@ def diagnose(gguf: GgufFile) -> Report:
     # A trimmed vocabulary would make every special token look absent, so the
     # vocabulary-dependent checks are skipped and the reason is reported instead.
     vocabulary = None if partial_vocab else _vocabulary(gguf)
-    eos = _eos_token(gguf, vocabulary) if not partial_vocab else None
+    eos = None if partial_vocab else _eos_token(gguf)
     if partial_vocab:
         report.findings.append(
             Finding(
@@ -466,9 +466,7 @@ def diagnose(gguf: GgufFile) -> Report:
         report.findings.extend(_check_delimiters(source, name))
         report.findings.extend(_check_balanced_blocks(source, name))
         report.findings.extend(_check_conventions(source, name))
-        report.findings.extend(
-            _check_special_tokens(source, name, gguf, vocabulary)
-        )
+        report.findings.extend(_check_special_tokens(source, name, vocabulary))
         if eos and eos not in source and "eos_token" not in source:
             report.findings.append(
                 Finding(
