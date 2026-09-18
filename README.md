@@ -129,9 +129,10 @@ pytest
 the parser is exercised against a real file and not only against synthetic fixtures. Every
 metadata value in it is the real one byte for byte, including the 2509-character chat template;
 only the three large vocabulary arrays (151936 entries) were truncated to 64 entries and the
-tensor table shortened to 3 entries so the file can live in the repository. It records its own
-provenance in `general.source.url` and `testing.vocab_trimmed_from`. The suite keeps running
-fully offline.
+tensor table shortened to 3 entries so the file can live in the repository. Those 3 tensor-info
+records are the published ones, so `token_embd.weight` keeps its real `[896, 151936]` shape and the
+file still states the vocabulary size it was built with. It records its own provenance in
+`general.source.url` and `testing.vocab_trimmed_from`. The suite keeps running fully offline.
 
 `tests/fixtures/mistral-nemo-instruct-2407-header.gguf` is a second such header, from
 [bartowski/Mistral-Nemo-Instruct-2407-GGUF](https://huggingface.co/bartowski/Mistral-Nemo-Instruct-2407-GGUF)

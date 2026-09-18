@@ -68,7 +68,14 @@ def test_real_gguf_tensor_table_and_alignment(real_gguf):
     assert gguf.tensor_count == len(gguf.tensors) == 3
     assert gguf.tensors[0].name == "output.weight"
     assert gguf.data_offset % 32 == 0
-    assert gguf.warnings == []
+    # Tensor-info records are the published ones: token_embd.weight keeps its real
+    # [n_embd, n_vocab] shape, which is how the file still declares a 151936-token
+    # vocabulary although only 64 tokens were kept.
+    embedding = next(t for t in gguf.tensors if t.name == "token_embd.weight")
+    assert embedding.dimensions == (896, 151936)
+    # Header-only, so the payload those records point at is absent - one warning.
+    assert len(gguf.warnings) == 1
+    assert "tensor data" in gguf.warnings[0]
 
 
 def test_real_gguf_records_its_provenance(real_gguf):
