@@ -82,7 +82,9 @@ Likely-wrong-but-usable problems (reported as `warning`):
 - `no-tokenizer-model` / `no-eos-token-id` / `token-id-out-of-range` — tokenizer metadata gaps
 
 The checks are structural rather than a full Jinja2 evaluation: the tool has no dependencies and
-runs offline, and the failures that actually break deployments are structural. Severities are
+runs offline, and the failures that actually break deployments are structural. Literal regions of
+the template (quoted strings, comments, `{% raw %}` bodies) are excluded from the structural scans,
+so text that merely looks like markup is not counted as markup. Severities are
 tiered so that a legitimate production template — which may use constructs a linter cannot fully
 evaluate — is not reported as broken. Named variants (`tokenizer.chat_template.tool_use` and
 friends) are each checked independently.
@@ -98,10 +100,16 @@ rejected explicitly rather than mis-parsed.
 
 ## Limitations
 
-Known limitation of v0.1: the lexical block check does not distinguish literal regions of a Jinja
-template — text inside `{% raw %}` … `{% endraw %}`, or delimiters written inside literal strings —
-from real markup, so `unbalanced-block` and `unbalanced-delimiter` can produce a false positive or
-miss a genuine mismatch in those places. This is an accepted limitation of version 0.1.
+The structural checks are lexical, not a Jinja parser. Before scanning, literal regions are blanked
+out — the contents of quoted strings inside `{{ … }}` / `{% … %}`, the bodies of `{# … #}` comments
+and the bodies of `{% raw %}` … `{% endraw %}` blocks — so a template that writes `{{- "}}" }}` to
+emit a literal brace pair is not reported as broken. Offsets in findings still refer to the original
+template.
+
+What remains out of reach is everything below the level of delimiters and block keywords: an
+expression that references an undefined variable, a filter that does not exist, a wrong argument
+count, `{% if %}` conditions that can never be true. `unbalanced-block` and `unbalanced-delimiter`
+answer the question "is this template structurally well-formed", not "does it render correctly".
 
 ## Not implemented
 
@@ -124,3 +132,14 @@ only the three large vocabulary arrays (151936 entries) were truncated to 64 ent
 tensor table shortened to 3 entries so the file can live in the repository. It records its own
 provenance in `general.source.url` and `testing.vocab_trimmed_from`. The suite keeps running
 fully offline.
+
+`tests/fixtures/mistral-nemo-instruct-2407-header.gguf` is a second such header, from
+[bartowski/Mistral-Nemo-Instruct-2407-GGUF](https://huggingface.co/bartowski/Mistral-Nemo-Instruct-2407-GGUF)
+(IQ2_M), trimmed the same way (131072 vocabulary entries → 64). It is kept as a regression fixture:
+its 3945-character template emits a literal `}}` from inside a quoted string, which an earlier
+version of the delimiter scan reported as an error on a healthy published model.
+
+`tests/test_jinja_agreement.py` cross-checks the structural verdicts against a real Jinja parser —
+anything Jinja2 accepts must not be reported as unbalanced, and structural breakage it rejects must
+be. Jinja2 is a test-only extra; it is never imported by the package, and the test skips if it is
+not installed.

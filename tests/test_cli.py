@@ -87,6 +87,15 @@ def test_real_file_exits_zero(real_gguf):
     assert "chat template(s): default" in out
 
 
+def test_published_nemo_header_reports_no_errors(nemo_gguf):
+    """Regression: a literal `}}` in the template used to be an ERROR finding."""
+    code, out, err = run(str(nemo_gguf))
+    assert "unbalanced" not in out
+    assert "0 error(s)" in out
+    assert code == EXIT_FINDINGS  # the remaining no-generation-prompt warning
+    assert err == ""
+
+
 def test_show_template_prints_the_real_template(real_gguf, qwen_template):
     code, out, _ = run(str(real_gguf), "--show-template")
     assert code == EXIT_OK

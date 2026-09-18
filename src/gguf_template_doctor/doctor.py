@@ -105,6 +105,83 @@ _MID_BLOCK = {"else", "elif"}
 _STATEMENT_RE = re.compile(r"\{%-?\s*(\w+)")
 _TOKEN_RE = re.compile(r"<\|[^|>]{1,64}\|>|\[/?(?:INST|SYS)\]|<s>|</s>")
 
+_TAG_OPEN_RE = re.compile(r"\{[{%#]")
+_RAW_TAG_RE = re.compile(r"\{%-?\s*raw\s*-?%\}")
+_ENDRAW_TAG_RE = re.compile(r"\{%-?\s*endraw\s*-?%\}")
+
+
+def _blank(out: list[str], start: int, stop: int) -> None:
+    """Replace ``out[start:stop]`` with spaces, keeping the length identical."""
+    for index in range(start, min(stop, len(out))):
+        if out[index] != "\n":
+            out[index] = " "
+
+
+def _blank_string(out: list[str], source: str, index: int) -> int:
+    """Blank the quoted string starting at *index*; return the offset after it."""
+    quote = source[index]
+    length = len(source)
+    _blank(out, index, index + 1)
+    position = index + 1
+    while position < length:
+        char = source[position]
+        if char == "\\" and position + 1 < length:
+            _blank(out, position, position + 2)
+            position += 2
+            continue
+        _blank(out, position, position + 1)
+        position += 1
+        if char == quote:
+            break
+    return position
+
+
+def mask_literal_regions(source: str) -> str:
+    """Return *source* with its literal regions replaced by spaces.
+
+    The block and delimiter checks are lexical: without this, a `}}` written
+    inside a quoted Jinja string - which published templates really do, to emit
+    a literal brace - is counted as markup and reported as a broken template.
+    Blanked are the contents of quoted strings inside `{{ }}` / `{% %}` tags,
+    the bodies of `{# #}` comments and the bodies of `{% raw %}` blocks.
+
+    The result has exactly the same length as *source*, and newlines are kept,
+    so offsets reported by the checks still point into the original template.
+    """
+    out = list(source)
+    length = len(source)
+    index = 0
+    while index < length:
+        match = _TAG_OPEN_RE.search(source, index)
+        if match is None:
+            break
+        start = match.start()
+        kind = source[start + 1]
+        if kind == "#":
+            end = source.find("#}", start + 2)
+            stop = length if end == -1 else end
+            _blank(out, start + 2, stop)
+            index = length if end == -1 else end + 2
+            continue
+        closer = "}}" if kind == "{" else "%}"
+        position = start + 2
+        while position < length:
+            char = source[position]
+            if char in "\"'":
+                position = _blank_string(out, source, position)
+                continue
+            if source.startswith(closer, position):
+                position += 2
+                break
+            position += 1
+        if kind == "%" and _RAW_TAG_RE.match(source, start):
+            end_match = _ENDRAW_TAG_RE.search(source, position)
+            stop = length if end_match is None else end_match.start()
+            _blank(out, position, stop)
+            position = stop
+        index = max(position, start + 1)
+    return "".join(out)
+
 
 def extract_templates(gguf: GgufFile) -> list[ChatTemplate]:
     """Collect the default template and any named variants from metadata."""
@@ -230,6 +307,17 @@ def _check_delimiters(source: str, name: str) -> list[Finding]:
                 )
             )
     return findings
+
+
+def check_template_structure(source: str, name: str = "default") -> list[Finding]:
+    """Run the lexical structure checks on one template.
+
+    Literal regions are blanked first (see :func:`mask_literal_regions`), so a
+    delimiter or block keyword written inside a string, a comment or a
+    `{% raw %}` body is not counted as markup.
+    """
+    masked = mask_literal_regions(source)
+    return _check_delimiters(masked, name) + _check_balanced_blocks(masked, name)
 
 
 def _check_conventions(source: str, name: str) -> list[Finding]:
@@ -463,8 +551,7 @@ def diagnose(gguf: GgufFile) -> Report:
     for template in report.templates:
         source = template.source
         name = template.name
-        report.findings.extend(_check_delimiters(source, name))
-        report.findings.extend(_check_balanced_blocks(source, name))
+        report.findings.extend(check_template_structure(source, name))
         report.findings.extend(_check_conventions(source, name))
         report.findings.extend(_check_special_tokens(source, name, vocabulary))
         if eos and eos not in source and "eos_token" not in source:

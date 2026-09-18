@@ -6,7 +6,7 @@ import pytest
 from gguf_builder import ARRAY, BOOL, STRING, UINT32, build_gguf
 
 from gguf_template_doctor import Severity, diagnose, parse_header
-from gguf_template_doctor.doctor import extract_templates
+from gguf_template_doctor.doctor import extract_templates, mask_literal_regions
 
 GOOD_TEMPLATE = (
     "{% for message in messages %}"
@@ -183,6 +183,134 @@ def test_whitespace_control_markers_are_understood(tmp_path):
     report = _diagnose(tmp_path, _model(template))
     assert "unbalanced-block" not in _codes(report)
     assert "unbalanced-delimiter" not in _codes(report)
+
+
+# --------------------------------------------------------------------------
+# Literal regions: text that looks like markup but is not.
+#
+# Published templates really do write `{{- "}}" }}` to emit a brace pair (the
+# Mistral-Nemo tool-call section does), so a scan that cannot tell a quoted
+# string from markup calls a healthy model broken.
+# --------------------------------------------------------------------------
+
+_TAIL = "{% if add_generation_prompt %}{{ 'a' }}{% endif %}"
+
+
+def test_delimiter_inside_a_string_literal_is_not_markup(tmp_path):
+    template = (
+        '{%- for m in messages %}{{ m.role }}{{ m.content }}{{- "}}" }}'
+        "{%- endfor %}" + _TAIL
+    )
+    report = _diagnose(tmp_path, _model(template))
+    assert "unbalanced-delimiter" not in _codes(report)
+    assert "unbalanced-block" not in _codes(report)
+
+
+def test_opening_delimiter_inside_a_string_literal_is_not_markup(tmp_path):
+    template = (
+        '{% for m in messages %}{{ m.role }}{{ m.content }}{{ "{{" }}{% endfor %}'
+        + _TAIL
+    )
+    report = _diagnose(tmp_path, _model(template))
+    assert "unbalanced-delimiter" not in _codes(report)
+
+
+def test_block_keyword_inside_a_string_literal_is_not_markup(tmp_path):
+    template = (
+        "{% for m in messages %}{{ m.role }}{{ m.content }}"
+        "{{ '{% endfor %}' }}{% endfor %}" + _TAIL
+    )
+    report = _diagnose(tmp_path, _model(template))
+    assert "unbalanced-block" not in _codes(report)
+
+
+def test_escaped_quote_does_not_end_the_string_literal(tmp_path):
+    template = (
+        "{% for m in messages %}{{ m.role }}{{ m.content }}"
+        "{{ 'it\\'s }} here' }}{% endfor %}" + _TAIL
+    )
+    report = _diagnose(tmp_path, _model(template))
+    assert "unbalanced-delimiter" not in _codes(report)
+
+
+def test_raw_block_body_is_not_scanned(tmp_path):
+    template = (
+        "{% for m in messages %}{{ m.role }}{{ m.content }}{% endfor %}"
+        "{% raw %}{{ this is not markup {% endif %}{% endraw %}" + _TAIL
+    )
+    report = _diagnose(tmp_path, _model(template))
+    assert "unbalanced-block" not in _codes(report)
+    assert "unbalanced-delimiter" not in _codes(report)
+
+
+def test_comment_body_is_not_scanned(tmp_path):
+    template = (
+        "{# a stray }} and an {% endif %} inside a comment #}"
+        "{% for m in messages %}{{ m.role }}{{ m.content }}{% endfor %}" + _TAIL
+    )
+    report = _diagnose(tmp_path, _model(template))
+    assert "unbalanced-block" not in _codes(report)
+    assert "unbalanced-delimiter" not in _codes(report)
+
+
+def test_real_breakage_next_to_a_literal_is_still_reported(tmp_path):
+    """Masking must not blind the checks to a genuine mismatch."""
+    template = '{{ "}}" }}{% for m in messages %}{{ m.content }}'
+    report = _diagnose(tmp_path, _model(template))
+    assert "unbalanced-block" in _codes(report, Severity.ERROR)
+
+
+def test_unterminated_string_literal_is_still_an_error(tmp_path):
+    template = "{% for m in messages %}{{ 'unterminated }}{% endfor %}" + _TAIL
+    report = _diagnose(tmp_path, _model(template))
+    assert "unbalanced-delimiter" in _codes(report, Severity.ERROR)
+
+
+def test_masking_keeps_offsets_in_finding_messages(tmp_path):
+    prefix = "{% for m in messages %}{{ m.content }}{% endfor %}"
+    template = prefix + '{{ "}}" }}}}'
+    report = _diagnose(tmp_path, _model(template))
+    finding = next(f for f in report.findings if f.code == "unbalanced-delimiter")
+    assert f"offset {len(prefix) + 10}" in finding.message
+
+
+def test_mask_literal_regions_keeps_length_and_blanks_only_literals():
+    source = '{{ "}}" }}'
+    assert mask_literal_regions(source) == "{{      }}"
+    assert len(mask_literal_regions(source)) == len(source)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "",
+        "plain text",
+        "{{",
+        "{% if x %}",
+        "{# unterminated comment",
+        "{{ 'unterminated string",
+        "{% raw %}never closed",
+        '{{ "\\\\" }}',
+        GOOD_TEMPLATE,
+    ],
+)
+def test_mask_literal_regions_never_changes_the_length(source):
+    assert len(mask_literal_regions(source)) == len(source)
+
+
+def test_mask_literal_regions_blanks_raw_and_comment_bodies():
+    assert mask_literal_regions("{% raw %}{{ x }}{% endraw %}") == (
+        "{% raw %}       {% endraw %}"
+    )
+    assert mask_literal_regions("{# }} #}") == "{#    #}"
+
+
+def test_mistral_nemo_template_is_not_reported_as_broken(nemo_gguf, nemo_template):
+    """Regression: the published Nemo template writes a literal `}}`."""
+    assert '"}}"' in nemo_template
+    report = diagnose(parse_header(nemo_gguf))
+    assert report.errors == []
+    assert _codes(report, Severity.WARNING) == {"no-generation-prompt"}
 
 
 # --------------------------------------------------------------------------
