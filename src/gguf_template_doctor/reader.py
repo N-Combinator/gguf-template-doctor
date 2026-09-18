@@ -202,29 +202,72 @@ def _check_type(type_id: int, what: str) -> None:
         raise GgufMalformedError(f"{what}: unknown GGUF value type {type_id}")
 
 
-#: Bytes per element for the ggml tensor types this tool needs to size.  Only
-#: the unquantised types are listed; a quantised tensor is block-compressed and
-#: its exact size depends on the block layout, so for anything else we fall back
-#: to the smallest possible size (1 byte/element).  That keeps the "data is
-#: missing" check conservative: it never over-estimates and so never warns about
-#: a complete file.
-_GGML_TYPE_SIZES = {
-    0: 4,  # F32
-    1: 2,  # F16
-    28: 8,  # F64
-    29: 4,  # I32 (also 26 in older builds)
+#: Per ggml type: (block size in elements, bytes per block).  Quantised types
+#: store whole blocks, so a tensor's byte size is
+#: elements / block_size * type_size.  Values follow the ggml type table in the
+#: GGUF specification.  A type absent from this table has an unknown element
+#: size: see :func:`_tensor_data_size`, which refuses to guess one.
+_GGML_TYPE_LAYOUT: dict[int, tuple[int, int]] = {
+    0: (1, 4),  # F32
+    1: (1, 2),  # F16
+    2: (32, 18),  # Q4_0
+    3: (32, 20),  # Q4_1
+    6: (32, 22),  # Q5_0
+    7: (32, 24),  # Q5_1
+    8: (32, 34),  # Q8_0
+    9: (32, 40),  # Q8_1
+    10: (256, 84),  # Q2_K
+    11: (256, 110),  # Q3_K
+    12: (256, 144),  # Q4_K
+    13: (256, 176),  # Q5_K
+    14: (256, 210),  # Q6_K
+    15: (256, 292),  # Q8_K
+    16: (256, 66),  # IQ2_XXS
+    17: (256, 74),  # IQ2_XS
+    18: (256, 98),  # IQ3_XXS
+    19: (256, 50),  # IQ1_S
+    20: (32, 18),  # IQ4_NL
+    21: (256, 110),  # IQ3_S
+    22: (256, 82),  # IQ2_S
+    23: (256, 136),  # IQ4_XS
+    24: (1, 1),  # I8
+    25: (1, 2),  # I16
+    26: (1, 4),  # I32
+    27: (1, 8),  # I64
+    28: (1, 8),  # F64
+    29: (256, 56),  # IQ1_M
+    30: (1, 2),  # BF16
+    34: (256, 54),  # TQ1_0
+    35: (256, 66),  # TQ2_0
 }
 
 
-def _tensor_data_size(tensors: list[TensorInfo]) -> int:
-    """Lower bound on the size of the tensor data section."""
+def _tensor_data_size(tensors: list[TensorInfo]) -> tuple[int | None, list[int]]:
+    """Size of the tensor data section, and the ggml types that blocked it.
+
+    Returns ``(total, unknown_types)``.  ``total`` is ``None`` when any tensor
+    uses a ggml type this tool does not know: an unknown type has an unknown
+    element size, and guessing one would turn a missing-payload check into a
+    fabricated number.  In that case the caller reports that the size could not
+    be computed instead of reporting a size.
+    """
     total = 0
+    unknown: list[int] = []
     for tensor in tensors:
+        layout = _GGML_TYPE_LAYOUT.get(tensor.ggml_type)
+        if layout is None:
+            if tensor.ggml_type not in unknown:
+                unknown.append(tensor.ggml_type)
+            continue
         elements = 1
         for dim in tensor.dimensions:
             elements *= dim
-        total += elements * _GGML_TYPE_SIZES.get(tensor.ggml_type, 1)
-    return total
+        block_size, type_size = layout
+        blocks = -(-elements // block_size)  # ceil: a partial block is stored whole
+        total += blocks * type_size
+    if unknown:
+        return None, unknown
+    return total, unknown
 
 
 def parse_header(path: str | Path) -> GgufFile:
@@ -320,12 +363,20 @@ def _parse_stream(stream: BinaryIO, path: Path, size: int | None) -> GgufFile:
     # readable, which is all this tool needs.  Header-only files are a normal way
     # to share model metadata.
     if size is not None:
-        expected_end = result.data_offset + _tensor_data_size(result.tensors)
-        if size < expected_end:
+        data_size, unknown_types = _tensor_data_size(result.tensors)
+        if data_size is None:
+            listed = ", ".join(str(t) for t in sorted(unknown_types))
             result.warnings.append(
-                f"file ends at {size} bytes but the tensor data section runs to "
-                f"{expected_end}; header is complete but tensor data is missing "
-                "or truncated"
+                f"tensor data section size not computed: unknown ggml type(s) "
+                f"{listed}; cannot tell whether the tensor data is present"
             )
+        else:
+            expected_end = result.data_offset + data_size
+            if size < expected_end:
+                result.warnings.append(
+                    f"file ends at {size} bytes but the tensor data section runs to "
+                    f"{expected_end}; header is complete but tensor data is missing "
+                    "or truncated"
+                )
 
     return result

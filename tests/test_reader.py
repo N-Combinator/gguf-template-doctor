@@ -466,3 +466,61 @@ def test_all_reader_errors_are_gguf_errors(tmp_path):
         path.write_bytes(payload)
         with pytest.raises(GgufError):
             parse_header(path)
+
+
+# --------------------------------------------------------------------------
+# An unknown ggml type means an unknown size - never an invented one.
+# --------------------------------------------------------------------------
+
+
+def test_unknown_ggml_type_does_not_get_a_made_up_element_size(tmp_path):
+    """A type we do not know must not be silently priced at 1 byte/element."""
+    path = tmp_path / "unknown-type.gguf"
+    path.write_bytes(
+        build_gguf(
+            [("general.architecture", STRING, "llama")],
+            tensors=[("a.weight", (1024,), 4242)],
+            with_data=False,
+        )
+    )
+    gguf = parse_header(path)
+    # The header is still fully readable...
+    assert gguf.metadata["general.architecture"] == "llama"
+    # ...but the tool says the size is unknown instead of claiming one.
+    assert any(
+        "not computed" in w and "4242" in w for w in gguf.warnings
+    ), gguf.warnings
+    assert not any("tensor data is missing" in w for w in gguf.warnings)
+
+
+def test_unknown_ggml_type_reports_none_rather_than_a_size():
+    from gguf_template_doctor.reader import TensorInfo, _tensor_data_size
+
+    total, unknown = _tensor_data_size([TensorInfo("a", (1024,), 4242, 0)])
+    assert total is None
+    assert unknown == [4242]
+
+
+def test_quantised_tensor_size_uses_the_real_block_layout():
+    """Q8_0 stores 32 elements per 34-byte block, not one byte per element."""
+    from gguf_template_doctor.reader import TensorInfo, _tensor_data_size
+
+    total, unknown = _tensor_data_size([TensorInfo("a", (256,), 8, 0)])
+    assert unknown == []
+    assert total == (256 // 32) * 34
+
+
+def test_ggml_type_table_matches_the_reference_implementation():
+    """Pin the block layout to the `gguf` package's table.
+
+    The sizes are hand-transcribed constants; a wrong one silently produces a
+    wrong (if honest) tensor-data size.  `gguf` is a dev-only extra, so this
+    skips on a bare install rather than adding a runtime dependency.
+    """
+    constants = pytest.importorskip("gguf.constants")
+
+    from gguf_template_doctor.reader import _GGML_TYPE_LAYOUT
+
+    for type_id, layout in _GGML_TYPE_LAYOUT.items():
+        quant = constants.GGMLQuantizationType(type_id)
+        assert layout == constants.GGML_QUANT_SIZES[quant], quant.name
