@@ -1,1 +1,0 @@
-gguf_template_doctor
