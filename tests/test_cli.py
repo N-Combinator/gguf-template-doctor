@@ -369,3 +369,97 @@ def test_json_output_keeps_finite_floats_as_numbers(non_finite_model):
     assert code == EXIT_OK
     payload = json.loads(out)
     assert isinstance(payload["metadata"]["llama.f32.scales"][0], float)
+
+
+# --------------------------------------------------------------------------
+# --list-metadata --json reports a long array's length; it never drops the key.
+# --------------------------------------------------------------------------
+
+
+def test_json_metadata_reports_long_list_length_instead_of_dropping_it(tmp_path):
+    tokens = [f"t{i}" for i in range(500)]
+    path = tmp_path / "long.gguf"
+    path.write_bytes(
+        build_gguf(
+            [
+                ("general.architecture", STRING, "llama"),
+                ("tokenizer.chat_template", STRING, GOOD_TEMPLATE),
+                ("tokenizer.ggml.tokens", ARRAY, (STRING, tokens)),
+                ("tokenizer.ggml.eos_token_id", UINT32, 1),
+            ]
+        )
+    )
+    code, out, _ = run(str(path), "--json", "--list-metadata")
+    assert code in (EXIT_OK, EXIT_FINDINGS)
+    metadata = json.loads(out)["metadata"]
+    assert "tokenizer.ggml.tokens" in metadata, "the key must not be dropped"
+    entry = metadata["tokenizer.ggml.tokens"]
+    assert entry["length"] == 500
+    assert entry["truncated"] is True
+    assert entry["items"] == tokens[:64]
+
+
+def test_json_metadata_keeps_short_lists_verbatim(tmp_path, good_model):
+    code, out, _ = run(str(good_model), "--json", "--list-metadata")
+    assert code in (EXIT_OK, EXIT_FINDINGS)
+    metadata = json.loads(out)["metadata"]
+    assert metadata["tokenizer.ggml.tokens"] == VOCAB
+
+
+# --------------------------------------------------------------------------
+# A narrow stdout encoding must degrade the report, not raise.
+# --------------------------------------------------------------------------
+
+
+class _AsciiOut(io.StringIO):
+    """Stands in for a stdout opened in a narrow encoding (e.g. LC_ALL=C)."""
+
+    encoding = "ascii"
+
+    def write(self, text):
+        text.encode(self.encoding)  # raises UnicodeEncodeError like a real stream
+        return super().write(text)
+
+
+def _non_ascii_model(tmp_path, name="nonascii.gguf"):
+    template = GOOD_TEMPLATE + "{{ 'Ответ — ' }}"
+    path = tmp_path / name
+    path.write_bytes(
+        build_gguf(
+            [
+                ("general.architecture", STRING, "llama"),
+                ("general.name", STRING, "модель"),
+                ("tokenizer.chat_template", STRING, template),
+                ("tokenizer.ggml.tokens", ARRAY, (STRING, VOCAB)),
+                ("tokenizer.ggml.eos_token_id", UINT32, 1),
+            ]
+        )
+    )
+    return path
+
+
+def test_text_report_survives_a_non_utf8_stdout(tmp_path):
+    path = _non_ascii_model(tmp_path)
+    out, err = _AsciiOut(), io.StringIO()
+    code = main([str(path), "--show-template"], out=out, err=err)
+    assert code in (EXIT_OK, EXIT_FINDINGS)
+    text = out.getvalue()
+    assert "findings" in text
+    assert "?" in text  # the unencodable characters were replaced, not fatal
+
+
+def test_json_report_survives_a_non_utf8_stdout(tmp_path):
+    path = _non_ascii_model(tmp_path)
+    out, err = _AsciiOut(), io.StringIO()
+    code = main([str(path), "--json", "--list-metadata"], out=out, err=err)
+    assert code in (EXIT_OK, EXIT_FINDINGS)
+    assert json.loads(out.getvalue())["metadata"]["general.architecture"] == "llama"
+
+
+def test_unreadable_file_error_survives_a_non_utf8_stderr(tmp_path):
+    path = tmp_path / "модель.gguf"
+    path.write_bytes(b"NOPE" + b"\x00" * 32)
+    out, err = io.StringIO(), _AsciiOut()
+    code = main([str(path)], out=out, err=err)
+    assert code == EXIT_UNREADABLE
+    assert "error:" in err.getvalue()

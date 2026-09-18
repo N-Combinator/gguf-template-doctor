@@ -271,11 +271,13 @@ def test_unterminated_string_literal_is_still_an_error(tmp_path):
 
 
 def test_masking_keeps_offsets_in_finding_messages(tmp_path):
-    prefix = "{% for m in messages %}{{ m.content }}{% endfor %}"
-    template = prefix + '{{ "}}" }}}}'
+    # The literal "}}" is masked before the scan, so the offset reported for the
+    # genuinely unclosed tag after it must still index into the original source.
+    prefix = '{% for m in messages %}{{ "}}" }}{% endfor %}'
+    template = prefix + "{{ m.content"
     report = _diagnose(tmp_path, _model(template))
     finding = next(f for f in report.findings if f.code == "unbalanced-delimiter")
-    assert f"offset {len(prefix) + 10}" in finding.message
+    assert f"offset {len(prefix)}" in finding.message
 
 
 def test_mask_literal_regions_keeps_length_and_blanks_only_literals():
@@ -571,3 +573,50 @@ def test_non_string_template_value_is_ignored(tmp_path):
     ]
     report = _diagnose(tmp_path, kv)
     assert "no-chat-template" in _codes(report, Severity.ERROR)
+
+
+# --------------------------------------------------------------------------
+# Delimiters in ordinary body text are output, not markup.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "literal",
+    ["Discount: 100%} off", "Braces }} in prose", "A hash #} in prose"],
+)
+def test_closing_delimiter_in_literal_text_is_not_a_finding(tmp_path, literal):
+    """`}}`, `%}` and `#}` outside any tag render literally; Jinja accepts them."""
+    template = GOOD_TEMPLATE + literal
+    report = _diagnose(tmp_path, _model(template))
+    assert "unbalanced-delimiter" not in _codes(report)
+
+
+def test_unclosed_tag_is_still_reported(tmp_path):
+    """The relaxed scan must not stop catching a genuinely unterminated tag."""
+    report = _diagnose(tmp_path, _model(GOOD_TEMPLATE + "{{ user.name"))
+    assert "unbalanced-delimiter" in _codes(report, Severity.ERROR)
+
+
+# --------------------------------------------------------------------------
+# `{%+` is a whitespace-control marker, not an unknown tag.
+# --------------------------------------------------------------------------
+
+
+def test_plus_marker_blocks_are_balanced(tmp_path):
+    template = "{%+ for m in messages %}{{ m.content }}{%+ endfor %}"
+    report = _diagnose(tmp_path, _model(template))
+    assert "unbalanced-block" not in _codes(report)
+
+
+def test_unclosed_plus_marker_block_is_reported(tmp_path):
+    """Jinja rejects this; so must we - the marker must not hide the block."""
+    template = "{%+ for m in messages %}{{ m.content }}"
+    report = _diagnose(tmp_path, _model(template))
+    assert "unbalanced-block" in _codes(report, Severity.ERROR)
+
+
+def test_plus_marker_raw_block_body_is_still_masked(tmp_path):
+    """`{%+ raw %}` opens a raw region just like `{% raw %}`."""
+    template = GOOD_TEMPLATE + "{%+ raw %}{% endfor %}{%+ endraw %}"
+    report = _diagnose(tmp_path, _model(template))
+    assert "unbalanced-block" not in _codes(report)

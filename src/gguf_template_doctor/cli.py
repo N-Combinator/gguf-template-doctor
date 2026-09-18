@@ -9,6 +9,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import math
 import sys
@@ -49,6 +50,45 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_json_safe(item) for item in value]
     return value
+
+
+#: Arrays longer than this are reported by length instead of in full: a GGUF
+#: vocabulary array is six figures long and would dwarf the report.
+MAX_JSON_LIST_ITEMS = 64
+
+
+def _summarize_long_list(value: Any) -> Any:
+    """Replace an over-long list with a length-carrying summary object.
+
+    Dropping the key entirely used to hide from the reader that the file has
+    the key at all.  The summary keeps the fact, the length and a short
+    preview, so `--list-metadata --json` never silently omits metadata.
+    """
+    if isinstance(value, list) and len(value) > MAX_JSON_LIST_ITEMS:
+        return {
+            "truncated": True,
+            "length": len(value),
+            "items": value[:MAX_JSON_LIST_ITEMS],
+        }
+    return value
+
+
+def _write_text(out: TextIO, text: str) -> None:
+    """Write *text* to *out*, degrading characters it cannot encode.
+
+    A report carrying non-ASCII template text (or a non-ASCII metadata value)
+    must not die with a UnicodeEncodeError because stdout was opened in a
+    narrow encoding - a redirect to a file under LC_ALL=C is enough.  The
+    unencodable characters are replaced; the report still prints.
+    """
+    try:
+        out.write(text)
+        return
+    except UnicodeEncodeError:
+        pass
+    encoding = getattr(out, "encoding", None) or "ascii"
+    safe = text.encode(encoding, errors="replace").decode(encoding, errors="replace")
+    out.write(safe)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -180,11 +220,12 @@ def main(
         gguf = parse_header(args.path)
     except GgufError as exc:
         # Every anticipated failure lands here as a single readable line.
-        print(f"gguf-template-doctor: error: {exc}", file=err)
+        _write_text(err, f"gguf-template-doctor: error: {exc}\n")
         return EXIT_UNREADABLE
 
     report = diagnose(gguf)
 
+    buffer = io.StringIO()
     if args.json:
         payload = summarize(report)
         payload["gguf_version"] = gguf.version
@@ -196,24 +237,26 @@ def main(
             }
         if args.list_metadata:
             payload["metadata"] = {
-                key: value
+                key: _summarize_long_list(value)
                 for key, value in gguf.metadata.items()
-                # Long arrays would dwarf the report; report their length instead.
-                if not (isinstance(value, list) and len(value) > 64)
             }
         # allow_nan=False makes any non-finite value we failed to convert a
         # loud ValueError instead of silently invalid JSON on stdout.
         json.dump(
             _json_safe(payload),
-            out,
+            buffer,
             indent=2,
             sort_keys=True,
             default=str,
             allow_nan=False,
         )
-        print("", file=out)
+        print("", file=buffer)
     else:
-        _print_text_report(report, gguf, args, out)
+        _print_text_report(report, gguf, args, buffer)
+
+    # One guarded write: stdout may be opened in an encoding that cannot hold
+    # the template's characters, and that must not become a traceback.
+    _write_text(out, buffer.getvalue())
 
     if report.errors or report.warnings:
         return EXIT_FINDINGS
