@@ -102,12 +102,15 @@ _BLOCK_PAIRS = {
 _CLOSERS = {v: k for k, v in _BLOCK_PAIRS.items()}
 _MID_BLOCK = {"else", "elif"}
 
-_STATEMENT_RE = re.compile(r"\{%-?\s*(\w+)")
+# Jinja allows a whitespace-control marker directly after the delimiter:
+# `-` strips surrounding whitespace, `+` explicitly keeps it.  Both are part of
+# the tag, not of the keyword.
+_STATEMENT_RE = re.compile(r"\{%[-+]?\s*(\w+)")
 _TOKEN_RE = re.compile(r"<\|[^|>]{1,64}\|>|\[/?(?:INST|SYS)\]|<s>|</s>")
 
 _TAG_OPEN_RE = re.compile(r"\{[{%#]")
-_RAW_TAG_RE = re.compile(r"\{%-?\s*raw\s*-?%\}")
-_ENDRAW_TAG_RE = re.compile(r"\{%-?\s*endraw\s*-?%\}")
+_RAW_TAG_RE = re.compile(r"\{%[-+]?\s*raw\s*[-+]?%\}")
+_ENDRAW_TAG_RE = re.compile(r"\{%[-+]?\s*endraw\s*[-+]?%\}")
 
 
 def _blank(out: list[str], start: int, stop: int) -> None:
@@ -264,48 +267,41 @@ def _check_balanced_blocks(source: str, name: str) -> list[Finding]:
     return findings
 
 
+_CLOSER_FOR = {"{{": "}}", "{%": "%}", "{#": "#}"}
+_LABEL_FOR = {"{{": "expression", "{%": "statement", "{#": "comment"}
+
+
 def _check_delimiters(source: str, name: str) -> list[Finding]:
-    """Look for delimiters that are opened and never closed."""
+    """Look for tags that are opened and never closed.
+
+    The scan walks the template tag by tag: it finds an opener, then the
+    matching closer, then continues after it.  A `}}`, `%}` or `#}` sitting in
+    ordinary body text is therefore never examined - Jinja renders it as
+    literal output - and only an opener with no closer after it is a finding.
+    """
     findings: list[Finding] = []
-    for opener, closer, label in (
-        ("{%", "%}", "statement"),
-        ("{{", "}}", "expression"),
-        ("{#", "#}", "comment"),
-    ):
-        depth = 0
-        index = 0
-        while index < len(source):
-            next_open = source.find(opener, index)
-            next_close = source.find(closer, index)
-            if next_open == -1 and next_close == -1:
-                break
-            if next_open != -1 and (next_close == -1 or next_open < next_close):
-                depth += 1
-                index = next_open + len(opener)
-            else:
-                if depth == 0:
-                    findings.append(
-                        Finding(
-                            Severity.ERROR,
-                            "unbalanced-delimiter",
-                            f"stray {closer!r} at offset {next_close} with no "
-                            f"matching {opener!r} ({label})",
-                            name,
-                        )
-                    )
-                    return findings
-                depth -= 1
-                index = next_close + len(closer)
-        if depth:
+    length = len(source)
+    index = 0
+    while index < length:
+        match = _TAG_OPEN_RE.search(source, index)
+        if match is None:
+            return findings
+        start = match.start()
+        opener = source[start : start + 2]
+        closer = _CLOSER_FOR[opener]
+        end = source.find(closer, start + 2)
+        if end == -1:
             findings.append(
                 Finding(
                     Severity.ERROR,
                     "unbalanced-delimiter",
-                    f"{depth} unclosed {opener!r} {label} delimiter(s); "
-                    f"missing {closer!r}",
+                    f"{opener!r} at offset {start} is never closed; missing "
+                    f"{closer!r} ({_LABEL_FOR[opener]})",
                     name,
                 )
             )
+            return findings
+        index = end + len(closer)
     return findings
 
 
