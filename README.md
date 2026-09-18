@@ -96,6 +96,13 @@ GGUF versions 2 and 3, all 13 metadata value types from the specification (`uint
 `bool`, `string`), arrays of any of them, and nested arrays. Version 1 used 32-bit counts and is
 rejected explicitly rather than mis-parsed.
 
+## Limitations
+
+Known limitation of v0.1: the lexical block check does not distinguish literal regions of a Jinja
+template — text inside `{% raw %}` … `{% endraw %}`, or delimiters written inside literal strings —
+from real markup, so `unbalanced-block` and `unbalanced-delimiter` can produce a false positive or
+miss a genuine mismatch in those places. This is an accepted limitation of version 0.1.
+
 ## Not implemented
 
 `--compare-known` (comparing a template against known-good reference templates) is deliberately
