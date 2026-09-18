@@ -130,6 +130,26 @@ def test_missing_template_exits_one(tmp_path):
     assert "no-chat-template" in out
 
 
+def test_eos_id_past_the_vocabulary_exits_one(tmp_path):
+    """A file whose eos id points past its own vocabulary must not look healthy."""
+    path = tmp_path / "bad-eos.gguf"
+    path.write_bytes(
+        build_gguf(
+            [
+                ("general.architecture", STRING, "llama"),
+                ("tokenizer.ggml.model", STRING, "gpt2"),
+                ("tokenizer.ggml.tokens", ARRAY, (STRING, ["a", "b", "c"])),
+                ("tokenizer.ggml.eos_token_id", UINT32, 999),
+                ("tokenizer.chat_template", STRING, GOOD_TEMPLATE),
+            ]
+        )
+    )
+    code, out, _ = run(str(path))
+    assert code == EXIT_FINDINGS
+    assert "token-id-out-of-range" in out
+    assert "eos_token_id is 999" in out
+
+
 def test_strict_turns_info_into_failure(real_gguf):
     assert run(str(real_gguf))[0] == EXIT_OK
     code, out, _ = run(str(real_gguf), "--strict")

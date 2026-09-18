@@ -79,7 +79,8 @@ Likely-wrong-but-usable problems (reported as `warning`):
 - `no-role-dispatch` / `no-content` — never reads a message `role` / `content`
 - `token-not-in-vocab` — the template emits a special token that is not in `tokenizer.ggml.tokens`
 - `eos-not-emitted` — the template never emits EOS nor references `eos_token`
-- `no-tokenizer-model` / `no-eos-token-id` / `token-id-out-of-range` — tokenizer metadata gaps
+- `no-tokenizer-model` / `no-eos-token-id` — tokenizer metadata gaps
+- `token-id-out-of-range` — `eos`/`bos`/`padding` token id points past the model's vocabulary
 
 The checks are structural rather than a full Jinja2 evaluation: the tool has no dependencies and
 runs offline, and the failures that actually break deployments are structural. Literal regions of
@@ -89,8 +90,14 @@ tiered so that a legitimate production template — which may use constructs a l
 evaluate — is not reported as broken. Named variants (`tokenizer.chat_template.tool_use` and
 friends) are each checked independently.
 
-Vocabulary-dependent checks are skipped when the file's own special-token ids point past the end
-of `tokenizer.ggml.tokens`, since an incomplete vocabulary would make every token look missing.
+Some files carry only part of their vocabulary — trimmed test fixtures, or metadata rewritten by a
+tool that dropped the token list. That is detected from evidence independent of the token ids: the
+declared `<arch>.vocab_size`, or the vocabulary dimension of `token_embd.weight`. When
+`tokenizer.ggml.tokens` is shorter than the vocabulary the file declares, `partial-vocabulary`
+(`info`) is reported and the checks that look tokens up (`token-not-in-vocab`, `eos-not-emitted`)
+are skipped, since an incomplete token list would make every token look missing. Token ids are
+still range-checked in that case — against the declared size — so an id that no vocabulary of this
+model could hold is reported either way.
 
 ## Supported GGUF
 

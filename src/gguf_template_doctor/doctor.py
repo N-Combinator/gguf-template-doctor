@@ -392,27 +392,51 @@ def _check_conventions(source: str, name: str) -> list[Finding]:
     return findings
 
 
-def vocabulary_is_partial(gguf: GgufFile) -> bool:
-    """True when the vocabulary present is smaller than the file's own token ids.
+def declared_vocabulary_size(gguf: GgufFile) -> int | None:
+    """Vocabulary size the file declares, judged without looking at token ids.
 
-    A header whose declared special-token ids point past the end of
-    ``tokenizer.ggml.tokens`` cannot have a complete vocabulary.  This happens in
-    slimmed test fixtures and in files whose metadata was rewritten by a tool that
-    dropped the vocab.  Vocabulary-dependent checks are meaningless in that case,
-    so they are skipped rather than emitting a finding per token.
+    Two independent sources are consulted, in order of directness:
+
+    * ``<arch>.vocab_size`` when the architecture publishes it;
+    * the vocabulary dimension of the token-embedding tensor - GGUF stores
+      ``token_embd.weight`` (and the untied ``output.weight``) as
+      ``[n_embd, n_vocab]``, so its second dimension is the real vocabulary size.
+
+    Neither depends on ``tokenizer.ggml.*_token_id`` being correct, which is what
+    lets a trimmed vocabulary be told apart from a genuinely wrong token id.
+    Returns ``None`` when the file declares its vocabulary size nowhere.
+    """
+    architecture = gguf.metadata.get("general.architecture")
+    if isinstance(architecture, str):
+        size = gguf.metadata.get(f"{architecture}.vocab_size")
+        if isinstance(size, int) and not isinstance(size, bool) and size > 0:
+            return size
+    tensors = {tensor.name: tensor for tensor in gguf.tensors}
+    for name in ("token_embd.weight", "output.weight"):
+        tensor = tensors.get(name)
+        if tensor is None or len(tensor.dimensions) != 2:
+            continue
+        if tensor.dimensions[1] > 0:
+            return tensor.dimensions[1]
+    return None
+
+
+def vocabulary_shortfall(gguf: GgufFile) -> tuple[int, int] | None:
+    """``(present, declared)`` when the token list is shorter than declared.
+
+    A file can carry fewer entries in ``tokenizer.ggml.tokens`` than the
+    vocabulary it declares: slimmed fixtures do it on purpose, and tools that
+    rewrite metadata have been known to drop the vocab.  Template checks that
+    look tokens up are meaningless then, because every token looks absent.
+    Returns ``None`` when the vocabulary is complete or its size is undeclared.
     """
     tokens = gguf.metadata.get("tokenizer.ggml.tokens")
     if not isinstance(tokens, list):
-        return False
-    for key in (
-        "tokenizer.ggml.eos_token_id",
-        "tokenizer.ggml.bos_token_id",
-        "tokenizer.ggml.padding_token_id",
-    ):
-        value = gguf.metadata.get(key)
-        if isinstance(value, int) and value >= len(tokens):
-            return True
-    return False
+        return None
+    declared = declared_vocabulary_size(gguf)
+    if declared is None or len(tokens) >= declared:
+        return None
+    return len(tokens), declared
 
 
 def _vocabulary(gguf: GgufFile) -> set[str] | None:
@@ -481,20 +505,31 @@ def _check_metadata(gguf: GgufFile) -> list[Finding]:
             )
         )
     tokens = gguf.metadata.get("tokenizer.ggml.tokens")
-    if isinstance(tokens, list) and not vocabulary_is_partial(gguf):
+    if isinstance(tokens, list):
+        # An id is out of range when it exceeds the vocabulary the model really
+        # has, which is the declared size when this file carries only part of the
+        # token list.  A trimmed vocab therefore stays silent while a genuinely
+        # wrong id - the classic bad-conversion failure that breaks stop-token
+        # handling - is reported whether the vocab is complete or not.
+        shortfall = vocabulary_shortfall(gguf)
+        if shortfall is None:
+            limit, source = len(tokens), "the vocabulary in this file has"
+        else:
+            limit, source = shortfall[1], "this file declares a vocabulary of"
         for key in (
             "tokenizer.ggml.eos_token_id",
             "tokenizer.ggml.bos_token_id",
             "tokenizer.ggml.padding_token_id",
         ):
             value = gguf.metadata.get(key)
-            if isinstance(value, int) and value >= len(tokens):
+            if not isinstance(value, int) or isinstance(value, bool):
+                continue
+            if value >= limit:
                 findings.append(
                     Finding(
                         Severity.WARNING,
                         "token-id-out-of-range",
-                        f"{key} is {value} but the vocabulary in this file has "
-                        f"only {len(tokens)} entries",
+                        f"{key} is {value} but {source} only {limit} entries",
                         "-",
                     )
                 )
@@ -532,19 +567,22 @@ def diagnose(gguf: GgufFile) -> Report:
         report.findings.extend(_check_metadata(gguf))
         return report
 
-    partial_vocab = vocabulary_is_partial(gguf)
+    shortfall = vocabulary_shortfall(gguf)
     # A trimmed vocabulary would make every special token look absent, so the
     # vocabulary-dependent checks are skipped and the reason is reported instead.
-    vocabulary = None if partial_vocab else _vocabulary(gguf)
-    eos = None if partial_vocab else _eos_token(gguf)
-    if partial_vocab:
+    # Token-id range checking is not skipped: it lives in _check_metadata and
+    # compares against the declared size rather than the truncated token list.
+    vocabulary = None if shortfall else _vocabulary(gguf)
+    eos = None if shortfall else _eos_token(gguf)
+    if shortfall:
+        present, declared = shortfall
         report.findings.append(
             Finding(
                 Severity.INFO,
                 "partial-vocabulary",
-                "this file's token ids point past the end of "
-                "tokenizer.ggml.tokens, so the vocabulary is incomplete; "
-                "vocabulary-dependent template checks were skipped",
+                f"tokenizer.ggml.tokens holds {present} entries but this file "
+                f"declares a vocabulary of {declared}, so the vocabulary is "
+                "incomplete; vocabulary-dependent template checks were skipped",
                 "-",
             )
         )

@@ -6,7 +6,11 @@ import pytest
 from gguf_builder import ARRAY, BOOL, STRING, UINT32, build_gguf
 
 from gguf_template_doctor import Severity, diagnose, parse_header
-from gguf_template_doctor.doctor import extract_templates, mask_literal_regions
+from gguf_template_doctor.doctor import (
+    declared_vocabulary_size,
+    extract_templates,
+    mask_literal_regions,
+)
 
 GOOD_TEMPLATE = (
     "{% for message in messages %}"
@@ -34,9 +38,9 @@ def _model(template=None, *, extra=(), tokens=VOCAB, eos=1):
     return kv
 
 
-def _diagnose(tmp_path, kv, name="m.gguf"):
+def _diagnose(tmp_path, kv, name="m.gguf", tensors=()):
     path = tmp_path / name
-    path.write_bytes(build_gguf(kv))
+    path.write_bytes(build_gguf(kv, tensors=tensors))
     return diagnose(parse_header(path))
 
 
@@ -406,15 +410,74 @@ def test_missing_tokenizer_model_is_a_warning(tmp_path):
 
 
 def test_token_id_out_of_range_is_a_warning(tmp_path):
-    """A model whose ids exceed its own vocab is reported once vocab is complete."""
+    """An id past the end of the vocabulary is reported, not silently accepted."""
     report = _diagnose(
         tmp_path,
         _model(GOOD_TEMPLATE, tokens=VOCAB, eos=None,
                extra=[("tokenizer.ggml.eos_token_id", UINT32, 1),
                       ("tokenizer.ggml.bos_token_id", UINT32, 99)]),
     )
-    # bos is out of range, which makes the vocabulary partial by definition.
+    finding = next(f for f in report.findings if f.code == "token-id-out-of-range")
+    assert finding.severity is Severity.WARNING
+    assert "bos_token_id is 99" in finding.message
+    assert "only 4 entries" in finding.message
+    assert not report.ok
+
+
+def test_eos_id_past_the_vocabulary_is_reported(tmp_path):
+    """The bad-conversion case: eos points nowhere, so generation never stops."""
+    report = _diagnose(tmp_path, _model(GOOD_TEMPLATE, tokens=["a", "b", "c"], eos=999))
+    codes = _codes(report, Severity.WARNING)
+    assert "token-id-out-of-range" in codes
+    assert "partial-vocabulary" not in _codes(report)
+    assert not report.ok
+
+
+def test_declared_vocab_size_makes_a_trimmed_vocabulary_recognisable(tmp_path):
+    """Ids consistent with the declared size are fine even if the list is short."""
+    report = _diagnose(
+        tmp_path,
+        _model(GOOD_TEMPLATE, tokens=VOCAB, eos=900,
+               extra=[("llama.vocab_size", UINT32, 1000)]),
+    )
+    finding = next(f for f in report.findings if f.code == "partial-vocabulary")
+    assert finding.severity is Severity.INFO
+    assert "4 entries" in finding.message and "1000" in finding.message
+    assert "token-id-out-of-range" not in _codes(report)
+    assert "token-not-in-vocab" not in _codes(report)
+
+
+def test_an_id_past_the_declared_size_is_still_out_of_range(tmp_path):
+    """A partial vocabulary does not excuse an id the whole model cannot hold."""
+    report = _diagnose(
+        tmp_path,
+        _model(GOOD_TEMPLATE, tokens=VOCAB, eos=5000,
+               extra=[("llama.vocab_size", UINT32, 1000)]),
+    )
+    finding = next(f for f in report.findings if f.code == "token-id-out-of-range")
+    assert "eos_token_id is 5000" in finding.message
+    assert "declares a vocabulary of only 1000" in finding.message
     assert "partial-vocabulary" in _codes(report, Severity.INFO)
+
+
+def test_token_embedding_shape_declares_the_vocabulary_size(tmp_path):
+    """Without a vocab_size key, token_embd.weight is [n_embd, n_vocab]."""
+    report = _diagnose(
+        tmp_path,
+        _model(GOOD_TEMPLATE, tokens=["a", "b", "c", "d"], eos=1),
+        tensors=[("token_embd.weight", (64, 1000), 0)],
+    )
+    assert "partial-vocabulary" in _codes(report, Severity.INFO)
+    assert "token-id-out-of-range" not in _codes(report)
+    # The template's <|im_start|> is absent only because the list was trimmed.
+    assert "token-not-in-vocab" not in _codes(report)
+
+
+def test_declared_vocab_size_prefers_the_metadata_key(tmp_path):
+    kv = _model(GOOD_TEMPLATE, extra=[("llama.vocab_size", UINT32, 1000)])
+    path = tmp_path / "m.gguf"
+    path.write_bytes(build_gguf(kv, tensors=[("token_embd.weight", (64, 77), 0)]))
+    assert declared_vocabulary_size(parse_header(path)) == 1000
 
 
 def test_partial_vocabulary_suppresses_token_checks(real_gguf):
@@ -422,7 +485,14 @@ def test_partial_vocabulary_suppresses_token_checks(real_gguf):
     report = diagnose(parse_header(real_gguf))
     assert "partial-vocabulary" in {f.code for f in report.findings}
     assert "token-not-in-vocab" not in {f.code for f in report.findings}
+    # Its real ids fit the vocabulary the file declares, so no range warning.
     assert "token-id-out-of-range" not in {f.code for f in report.findings}
+
+
+def test_both_real_fixtures_declare_their_full_vocabulary(real_gguf, nemo_gguf):
+    """Evidence for the trimmed vocab comes from the files, not from the ids."""
+    assert declared_vocabulary_size(parse_header(real_gguf)) == 151936
+    assert declared_vocabulary_size(parse_header(nemo_gguf)) == 131072
 
 
 def test_no_vocab_at_all_skips_token_checks(tmp_path):
