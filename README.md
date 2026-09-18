@@ -44,6 +44,20 @@ summary: 0 error(s), 0 warning(s), 0 info
 have no JSON literal, so those values are emitted as the strings `"NaN"`, `"Infinity"` and
 `"-Infinity"` rather than the bare tokens a strict parser would reject.
 
+With `--list-metadata --json`, an array longer than 64 entries (a vocabulary is six figures long)
+is reported as an object carrying its full length plus the first 64 entries, rather than in full,
+so no key is ever dropped from the output:
+
+```json
+"tokenizer.ggml.tokens": { "truncated": true, "length": 151936, "items": ["!", "\"", "#", "..."] }
+```
+
+Arrays of 64 entries or fewer are emitted verbatim as plain JSON arrays.
+
+The report is written with unencodable characters replaced, so a template containing non-ASCII text
+still prints when stdout is opened in a narrow encoding (`LC_ALL=C`, a redirect under an ASCII
+locale) instead of failing with a `UnicodeEncodeError`.
+
 ### Exit codes
 
 | Code | Meaning |
@@ -112,6 +126,13 @@ out — the contents of quoted strings inside `{{ … }}` / `{% … %}`, the bod
 and the bodies of `{% raw %}` … `{% endraw %}` blocks — so a template that writes `{{- "}}" }}` to
 emit a literal brace pair is not reported as broken. Offsets in findings still refer to the original
 template.
+
+Closing delimiters in ordinary body text (`}}`, `%}`, `#}` outside any tag) are output, not markup,
+and are not reported; Jinja's `{%+` whitespace-control marker is understood like `{%-`.
+
+A tensor whose `ggml` type this tool does not know has an unknown element size, so the size of the
+tensor data section cannot be computed. The report says so rather than guessing a size — the
+missing-tensor-data check is skipped for such a file instead of producing a fabricated number.
 
 What remains out of reach is everything below the level of delimiters and block keywords: an
 expression that references an undefined variable, a filter that does not exist, a wrong argument
