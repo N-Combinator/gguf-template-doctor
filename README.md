@@ -222,3 +222,20 @@ not installed.
 [`docs/motivation.md`](docs/motivation.md). Each builds a GGUF carrying exactly the template defect
 its report describes, runs the CLI over it, and asserts the tool both finds the defect and names the
 cause; the source link and quote are in the test's docstring.
+
+## Releases
+
+Pushing a `vX.Y.Z` tag runs [`.github/workflows/release.yml`](.github/workflows/release.yml),
+which runs the test suite, checks the tag against the packaged version, builds a wheel and an
+sdist and attaches both to the GitHub Release.
+
+The version is declared in two places — `version` in `pyproject.toml` (what goes into the wheel
+metadata) and `__version__` in `src/gguf_template_doctor/__init__.py` (what
+`gguf-template-doctor --version` prints). Both must equal the tag, or the release fails before
+anything is built; `scripts/check_version_tag.py` is the check, and it can be run locally:
+
+```sh
+python scripts/check_version_tag.py v0.1.0
+```
+
+Nothing is published to PyPI.
